@@ -281,6 +281,9 @@ class CommandGateway:
         goal.max_linear_velocity = linear_velocity / 1000.0
         goal.max_linear_acceleration = linear_acceleration / 1000.0
         goal.max_angular_velocity = angular_velocity * DEG_TO_RAD
+        # Angular acceleration is accepted for protocol compatibility; Pilz LIN
+        # derives rotational acceleration from cartesian_limits and does not use
+        # this field as an independent timing constraint.
         goal.max_angular_acceleration = angular_acceleration * DEG_TO_RAD
         await self.bridge.send_goal("movel", goal)
         return {

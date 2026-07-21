@@ -51,8 +51,9 @@ def generate_launch_description():
             (moveit_share / "config" / "kinematics.yaml").read_text(encoding="utf-8")
         )
     }
-    # joint_limits.yaml is the single source for acceleration limits; position and
-    # velocity limits come from the URDF. The manager reads both via its robot model.
+    # joint_limits.yaml is the source for joint acceleration overrides (URDF has
+    # position/velocity). Pilz TCP caps live in pilz_cartesian_limits.yaml for
+    # move_group only; manager MoveL caps are compile-time constants in manager_node.cpp.
     robot_description_planning = {
         "robot_description_planning": yaml.safe_load(
             (moveit_share / "config" / "joint_limits.yaml").read_text(encoding="utf-8")

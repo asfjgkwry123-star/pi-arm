@@ -15,6 +15,7 @@ sudo apt-get install -y \
   ros-jazzy-joint-state-publisher-gui \
   ros-jazzy-joint-trajectory-controller \
   ros-jazzy-moveit \
+  ros-jazzy-pilz-industrial-motion-planner \
   ros-jazzy-ros2-control \
   ros-jazzy-ros2-controllers \
   ros-jazzy-rviz2 \
