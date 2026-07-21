@@ -1,0 +1,9 @@
+trajectory_msgs/JointTrajectory trajectory
+---
+bool success
+int32 code
+string message
+---
+uint64 task_id
+float32 progress
+string message

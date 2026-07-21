@@ -1,0 +1,22 @@
+# Acceleration limits only. Position and velocity limits live in the URDF
+# (pi_arm_description/urdf/pi_arm.urdf.xacro), which is the single source of
+# truth; MoveIt and the manager fall back to the URDF for velocity limits.
+joint_limits:
+  joint_01:
+    has_acceleration_limits: true
+    max_acceleration: 0.3490659
+  joint_02:
+    has_acceleration_limits: true
+    max_acceleration: 0.3490659
+  joint_03:
+    has_acceleration_limits: true
+    max_acceleration: 0.3490659
+  joint_05:
+    has_acceleration_limits: true
+    max_acceleration: 0.3490659
+  joint_06:
+    has_acceleration_limits: true
+    max_acceleration: 0.3490659
+  joint_09:
+    has_acceleration_limits: true
+    max_acceleration: 0.3490659

@@ -1,0 +1,14 @@
+builtin_interfaces/Time stamp
+bool connected
+string driver_mode
+string management_operation
+string[] joint_names
+float64[] positions
+float64[] velocities
+bool[] enabled
+bool[] errors
+bool[] moving
+bool[] fresh
+int32[] error_codes
+float64[] ages_sec
+string diagnostic

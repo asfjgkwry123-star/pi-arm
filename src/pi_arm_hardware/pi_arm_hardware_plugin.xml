@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<library path="pi_arm_hardware">
+  <class
+    name="pi_arm_hardware/PiArmSystemHardware"
+    type="pi_arm_hardware::PiArmSystem"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>
+      Six-axis Pi Arm ros2_control SystemInterface with selectable real SocketCAN and mock backends.
+    </description>
+  </class>
+  <class
+    name="pi_arm_hardware/PiArmSystem"
+    type="pi_arm_hardware::PiArmSystem"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>Compatibility alias for PiArmSystemHardware.</description>
+  </class>
+</library>

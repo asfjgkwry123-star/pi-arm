@@ -1,0 +1,5 @@
+int32 motor_id
+---
+bool success
+int32 code
+string message

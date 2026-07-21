@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<robot name="pi_arm">
+  <virtual_joint name="world_joint" type="fixed" parent_frame="world" child_link="base_link"/>
+
+  <group name="pi_arm">
+    <chain base_link="base_link" tip_link="tool0"/>
+  </group>
+  <group name="tool">
+    <link name="tool0"/>
+  </group>
+
+  <end_effector name="tool0" parent_link="link_09" group="tool" parent_group="pi_arm"/>
+
+  <passive_joint name="joint_04"/>
+  <passive_joint name="joint_07"/>
+  <passive_joint name="joint_08"/>
+
+  <group_state name="home" group="pi_arm">
+    <joint name="joint_01" value="0"/>
+    <joint name="joint_02" value="0"/>
+    <joint name="joint_03" value="0"/>
+    <joint name="joint_05" value="0"/>
+    <joint name="joint_06" value="0"/>
+    <joint name="joint_09" value="0"/>
+  </group_state>
+
+  <disable_collisions link1="base_link" link2="link_01" reason="Adjacent"/>
+  <disable_collisions link1="link_01" link2="link_02" reason="Adjacent"/>
+  <disable_collisions link1="link_02" link2="link_03" reason="Adjacent"/>
+  <disable_collisions link1="link_03" link2="link_04" reason="Adjacent"/>
+  <disable_collisions link1="link_04" link2="link_05" reason="Adjacent"/>
+  <disable_collisions link1="link_05" link2="link_06" reason="Adjacent"/>
+  <disable_collisions link1="link_06" link2="link_07" reason="Adjacent"/>
+  <disable_collisions link1="link_07" link2="link_08" reason="Adjacent"/>
+  <disable_collisions link1="link_08" link2="link_09" reason="Adjacent"/>
+  <disable_collisions link1="link_09" link2="tool0" reason="Adjacent"/>
+
+  <!-- Primitive collision shapes are padded bounding volumes; these pairs sit
+       around shared joint origins (elbow and wrist clusters) and permanently
+       overlap by construction while being mechanically unable to collide. -->
+  <disable_collisions link1="link_02" link2="link_04" reason="Never"/>
+  <disable_collisions link1="link_04" link2="link_06" reason="Never"/>
+  <disable_collisions link1="link_06" link2="link_08" reason="Never"/>
+  <disable_collisions link1="link_06" link2="link_09" reason="Never"/>
+  <disable_collisions link1="link_07" link2="link_09" reason="Never"/>
+</robot>

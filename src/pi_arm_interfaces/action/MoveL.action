@@ -1,0 +1,13 @@
+geometry_msgs/PoseStamped target
+float64 max_linear_velocity
+float64 max_linear_acceleration
+float64 max_angular_velocity
+float64 max_angular_acceleration
+---
+bool success
+int32 code
+string message
+---
+uint64 task_id
+float32 progress
+string message

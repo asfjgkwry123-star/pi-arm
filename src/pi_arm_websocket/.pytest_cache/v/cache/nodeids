@@ -1,0 +1,18 @@
+[
+  "test/test_protocol.py::test_all_legacy_commands_are_accepted_by_parser[disable_motor]",
+  "test/test_protocol.py::test_all_legacy_commands_are_accepted_by_parser[enable_motor]",
+  "test/test_protocol.py::test_all_legacy_commands_are_accepted_by_parser[motor_move]",
+  "test/test_protocol.py::test_all_legacy_commands_are_accepted_by_parser[motor_stop]",
+  "test/test_protocol.py::test_all_legacy_commands_are_accepted_by_parser[move]",
+  "test/test_protocol.py::test_all_legacy_commands_are_accepted_by_parser[movej]",
+  "test/test_protocol.py::test_all_legacy_commands_are_accepted_by_parser[movejs]",
+  "test/test_protocol.py::test_all_legacy_commands_are_accepted_by_parser[movel]",
+  "test/test_protocol.py::test_all_legacy_commands_are_accepted_by_parser[reset_motor]",
+  "test/test_protocol.py::test_all_legacy_commands_are_accepted_by_parser[set_zero]",
+  "test/test_protocol.py::test_all_legacy_commands_are_accepted_by_parser[stop_motion]",
+  "test/test_protocol.py::test_parse_request_normalizes_command_and_defaults_params",
+  "test/test_protocol.py::test_parse_request_reports_stable_error_codes[not-json-1001]",
+  "test/test_protocol.py::test_parse_request_reports_stable_error_codes[{\"type\":\"req\",\"cmd\":\"unknown\"}-1003]",
+  "test/test_protocol.py::test_parse_request_reports_stable_error_codes[{\"type\":\"state\",\"cmd\":\"movej\"}-1002]",
+  "test/test_protocol.py::test_response_keeps_legacy_ms_field"
+]
