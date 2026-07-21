@@ -15,8 +15,11 @@
 #include <utility>
 #include <vector>
 
+#include <Eigen/Geometry>
+
 #include "control_msgs/action/follow_joint_trajectory.hpp"
 #include "moveit/move_group_interface/move_group_interface.hpp"
+#include "moveit/robot_state/robot_state.hpp"
 #include "moveit/robot_trajectory/robot_trajectory.hpp"
 #include "moveit/trajectory_processing/time_optimal_trajectory_generation.hpp"
 #include "moveit_msgs/msg/robot_trajectory.hpp"
@@ -32,6 +35,7 @@
 #include "pi_arm_manager/state_aggregator.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
+#include "trajectory_msgs/msg/joint_trajectory.hpp"
 
 using namespace std::chrono_literals;
 
@@ -50,6 +54,102 @@ struct JointLimits
   double velocity{0.0};
   double acceleration{0.0};
 };
+
+struct CartesianPeaks
+{
+  double linear_velocity{0.0};
+  double angular_velocity{0.0};
+  double linear_acceleration{0.0};
+  double angular_acceleration{0.0};
+};
+
+// Peak TCP speed/accel along a timed joint trajectory (finite differences on EE pose).
+CartesianPeaks measure_cartesian_peaks(
+  robot_trajectory::RobotTrajectory & trajectory, const std::string & ee_link)
+{
+  CartesianPeaks peaks;
+  const std::size_t n = trajectory.getWayPointCount();
+  if (n < 2) {
+    return peaks;
+  }
+
+  std::vector<double> times(n, 0.0);
+  std::vector<double> linear_speeds(n, 0.0);
+  std::vector<double> angular_speeds(n, 0.0);
+  for (std::size_t i = 0; i < n; ++i) {
+    trajectory.getWayPointPtr(i)->updateLinkTransforms();
+    if (i > 0) {
+      times[i] = times[i - 1] + trajectory.getWayPointDurationFromPrevious(i);
+    }
+  }
+
+  Eigen::Isometry3d prev_pose = trajectory.getWayPoint(0).getGlobalLinkTransform(ee_link);
+  for (std::size_t i = 1; i < n; ++i) {
+    const Eigen::Isometry3d pose = trajectory.getWayPoint(i).getGlobalLinkTransform(ee_link);
+    const double dt = std::max(trajectory.getWayPointDurationFromPrevious(i), 1e-9);
+    const double d_lin = (pose.translation() - prev_pose.translation()).norm();
+    const double d_ang = Eigen::Quaterniond(prev_pose.rotation()).angularDistance(
+      Eigen::Quaterniond(pose.rotation()));
+    linear_speeds[i] = d_lin / dt;
+    angular_speeds[i] = d_ang / dt;
+    peaks.linear_velocity = std::max(peaks.linear_velocity, linear_speeds[i]);
+    peaks.angular_velocity = std::max(peaks.angular_velocity, angular_speeds[i]);
+    prev_pose = pose;
+  }
+  for (std::size_t i = 2; i < n; ++i) {
+    const double dt = std::max(times[i] - times[i - 1], 1e-9);
+    peaks.linear_acceleration = std::max(
+      peaks.linear_acceleration, std::abs(linear_speeds[i] - linear_speeds[i - 1]) / dt);
+    peaks.angular_acceleration = std::max(
+      peaks.angular_acceleration, std::abs(angular_speeds[i] - angular_speeds[i - 1]) / dt);
+  }
+  return peaks;
+}
+
+// Uniform time stretch: positions unchanged, v' = v/k, a' = a/k^2. k >= 1 slows motion.
+void stretch_joint_trajectory(trajectory_msgs::msg::JointTrajectory & trajectory, double k)
+{
+  if (k <= 1.0 + 1e-12) {
+    return;
+  }
+  for (auto & point : trajectory.points) {
+    const double t = rclcpp::Duration(point.time_from_start).seconds() * k;
+    point.time_from_start = rclcpp::Duration::from_seconds(t);
+    for (double & velocity : point.velocities) {
+      velocity /= k;
+    }
+    for (double & acceleration : point.accelerations) {
+      acceleration /= (k * k);
+    }
+  }
+}
+
+// Industry MoveL timing: joint-feasible TOTG first, then slow down so TCP respects
+// the commanded Cartesian velocity/acceleration (never speed up past joint limits).
+double cartesian_limit_stretch(
+  const CartesianPeaks & peaks,
+  double max_linear_velocity, double max_linear_acceleration,
+  double max_angular_velocity, double max_angular_acceleration)
+{
+  double stretch = 1.0;
+  if (peaks.linear_velocity > 1e-9) {
+    stretch = std::max(stretch, peaks.linear_velocity / std::max(max_linear_velocity, 1e-9));
+  }
+  if (peaks.angular_velocity > 1e-9) {
+    stretch = std::max(stretch, peaks.angular_velocity / std::max(max_angular_velocity, 1e-9));
+  }
+  if (peaks.linear_acceleration > 1e-9) {
+    stretch = std::max(
+      stretch,
+      std::sqrt(peaks.linear_acceleration / std::max(max_linear_acceleration, 1e-9)));
+  }
+  if (peaks.angular_acceleration > 1e-9) {
+    stretch = std::max(
+      stretch,
+      std::sqrt(peaks.angular_acceleration / std::max(max_angular_acceleration, 1e-9)));
+  }
+  return stretch;
+}
 
 }  // namespace
 
@@ -96,6 +196,9 @@ public:
       "/pi_arm/state", rclcpp::QoS(10).reliable().transient_local());
 
     service_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    // Reentrant group so worker threads can wait_for() action futures without
+    // starving against the default MutuallyExclusive group (timers/subscriptions).
+    action_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     enable_client_ = create_client<pi_arm_interfaces::srv::ManageMotor>(
       "/pi_arm/hardware/enable_motor", rmw_qos_profile_services_default, service_group_);
     disable_client_ = create_client<pi_arm_interfaces::srv::ManageMotor>(
@@ -104,7 +207,8 @@ public:
       "/pi_arm/hardware/reset_motor", rmw_qos_profile_services_default, service_group_);
     zero_client_ = create_client<pi_arm_interfaces::srv::ManageMotor>(
       "/pi_arm/hardware/set_zero", rmw_qos_profile_services_default, service_group_);
-    follow_client_ = rclcpp_action::create_client<Follow>(this, follow_action_name_);
+    follow_client_ = rclcpp_action::create_client<Follow>(
+      this, follow_action_name_, action_group_);
 
     enable_service_ = make_management_service(
       "/pi_arm/enable_motor", enable_client_, Operation::ENABLE);
@@ -397,12 +501,21 @@ private:
     const auto deadline = std::chrono::steady_clock::now() +
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
       std::chrono::duration<double>(motion_timeout_));
+    auto next_log = std::chrono::steady_clock::now();
     while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
       if (stop_requested_.load()) {
         return false;
       }
       if (still_frames_.load() >= 3) {
         return true;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= next_log) {
+        RCLCPP_INFO(
+          get_logger(), "wait_still: still_frames=%d remain=%.1fs",
+          still_frames_.load(),
+          std::chrono::duration<double>(deadline - now).count());
+        next_log = now + 1s;
       }
       std::this_thread::sleep_for(20ms);
     }
@@ -679,52 +792,107 @@ private:
   {
     publish_feedback<MoveL>(handle, 0.0F, "running");
     const auto goal = handle->get_goal();
-    move_group_->setPoseReferenceFrame(
-      goal->target.header.frame_id.empty() ? "base_link" : goal->target.header.frame_id);
-    move_group_->limitMaxCartesianLinkSpeed(goal->max_linear_velocity, "tool0");
-    const double velocity_scaling = std::clamp(
-      std::min(
-        goal->max_linear_velocity / std::max(1e-9, linear_velocity_limit_),
-        goal->max_angular_velocity / std::max(1e-9, angular_velocity_limit_)),
-      0.001, 1.0);
-    const double acceleration_scaling = std::clamp(
-      std::min(
-        goal->max_linear_acceleration / std::max(1e-9, linear_acceleration_limit_),
-        goal->max_angular_acceleration / std::max(1e-9, angular_acceleration_limit_)),
-      0.001, 1.0);
-    move_group_->setMaxVelocityScalingFactor(velocity_scaling);
-    move_group_->setMaxAccelerationScalingFactor(acceleration_scaling);
-    bool backend_ok = false;
-    try {
-      moveit_msgs::msg::RobotTrajectory trajectory;
-      const std::vector<geometry_msgs::msg::Pose> waypoints{goal->target.pose};
-      const double fraction =
-        move_group_->computeCartesianPath(waypoints, 0.005, trajectory, true);
-      if (fraction < 0.999) {
-        throw std::runtime_error(
-                "movel Cartesian path is incomplete: fraction=" + std::to_string(fraction));
-      }
-      const auto current_state = move_group_->getCurrentState(operation_timeout_);
-      if (!current_state) {
-        throw std::runtime_error("movel current robot state is unavailable");
-      }
-      robot_trajectory::RobotTrajectory timed_trajectory(
-        move_group_->getRobotModel(), "pi_arm");
-      timed_trajectory.setRobotTrajectoryMsg(*current_state, trajectory);
-      trajectory_processing::TimeOptimalTrajectoryGeneration time_parameterization;
-      if (!time_parameterization.computeTimeStamps(
-          timed_trajectory, velocity_scaling, acceleration_scaling))
-      {
-        throw std::runtime_error("movel trajectory time parameterization failed");
-      }
-      timed_trajectory.getRobotTrajectoryMsg(trajectory);
-      backend_ok = static_cast<bool>(move_group_->execute(trajectory));
-    } catch (...) {
-      move_group_->clearMaxCartesianLinkSpeed();
-      throw;
+    const std::string frame =
+      goal->target.header.frame_id.empty() ? "base_link" : goal->target.header.frame_id;
+    const auto & pose = goal->target.pose;
+    RCLCPP_INFO(
+      get_logger(),
+      "movel start: frame=%s target xyz=(%.4f, %.4f, %.4f) "
+      "max_lin_v=%.4f m/s max_lin_a=%.4f m/s2 max_ang_v=%.4f rad/s max_ang_a=%.4f rad/s2",
+      frame.c_str(), pose.position.x, pose.position.y, pose.position.z,
+      goal->max_linear_velocity, goal->max_linear_acceleration,
+      goal->max_angular_velocity, goal->max_angular_acceleration);
+    move_group_->setPoseReferenceFrame(frame);
+    // Path geometry only — do NOT map page TCP speed onto joint TOTG scaling.
+    // Requested Cartesian limits are applied after joint-feasible timing (below).
+    move_group_->setMaxVelocityScalingFactor(1.0);
+    move_group_->setMaxAccelerationScalingFactor(1.0);
+    moveit_msgs::msg::RobotTrajectory trajectory;
+    const std::vector<geometry_msgs::msg::Pose> waypoints{goal->target.pose};
+    RCLCPP_INFO(get_logger(), "movel calling computeCartesianPath...");
+    const double fraction =
+      move_group_->computeCartesianPath(waypoints, 0.005, trajectory, true);
+    RCLCPP_INFO(
+      get_logger(),
+      "movel Cartesian path done: fraction=%.4f points=%zu joints=%zu",
+      fraction, trajectory.joint_trajectory.points.size(),
+      trajectory.joint_trajectory.joint_names.size());
+    if (fraction < 0.999) {
+      throw std::runtime_error(
+              "movel Cartesian path is incomplete: fraction=" + std::to_string(fraction));
     }
-    move_group_->clearMaxCartesianLinkSpeed();
-    complete_action<MoveL>(handle, backend_ok, "movel");
+    publish_feedback<MoveL>(handle, 0.2F, "cartesian_planned");
+    RCLCPP_INFO(get_logger(), "movel fetching current robot state...");
+    const auto current_state = move_group_->getCurrentState(operation_timeout_);
+    if (!current_state) {
+      throw std::runtime_error("movel current robot state is unavailable");
+    }
+    // 1) TOTG at full joint capability → feasible joint vel/acc + initial timing.
+    // 2) Uniform time stretch so peak TCP speed/accel match the page command.
+    //    Stretch only slows down; joint limits remain satisfied.
+    RCLCPP_INFO(get_logger(), "movel TOTG at full joint limits, then Cartesian stretch...");
+    robot_trajectory::RobotTrajectory timed_trajectory(
+      move_group_->getRobotModel(), "pi_arm");
+    timed_trajectory.setRobotTrajectoryMsg(*current_state, trajectory);
+    trajectory_processing::TimeOptimalTrajectoryGeneration time_parameterization;
+    if (!time_parameterization.computeTimeStamps(timed_trajectory, 1.0, 1.0)) {
+      throw std::runtime_error("movel trajectory time parameterization failed");
+    }
+    const CartesianPeaks peaks = measure_cartesian_peaks(timed_trajectory, "tool0");
+    const double stretch = cartesian_limit_stretch(
+      peaks, goal->max_linear_velocity, goal->max_linear_acceleration,
+      goal->max_angular_velocity, goal->max_angular_acceleration);
+    timed_trajectory.getRobotTrajectoryMsg(trajectory);
+    stretch_joint_trajectory(trajectory.joint_trajectory, stretch);
+    RCLCPP_INFO(
+      get_logger(),
+      "movel Cartesian peaks before stretch: lin_v=%.4f m/s ang_v=%.4f rad/s "
+      "lin_a=%.4f m/s2 ang_a=%.4f rad/s2; stretch=%.3f",
+      peaks.linear_velocity, peaks.angular_velocity,
+      peaks.linear_acceleration, peaks.angular_acceleration, stretch);
+    // Do not use move_group_->execute() here: MoveGroupInterface blocking execute
+    // is unreliable when this node is already spun by MultiThreadedExecutor and the
+    // call runs on a worker thread (task stays RUNNING, joints never move). Send the
+    // timed trajectory directly to the controller, same path as movejs/direct_move.
+    Follow::Goal follow_goal;
+    follow_goal.trajectory = trajectory.joint_trajectory;
+    // stamp=0 means "execute as soon as received" for joint_trajectory_controller.
+    follow_goal.trajectory.header.stamp = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    if (follow_goal.trajectory.joint_names.empty() || follow_goal.trajectory.points.empty()) {
+      throw std::runtime_error("movel produced an empty joint trajectory");
+    }
+    log_trajectory_summary("movel", follow_goal.trajectory);
+    publish_feedback<MoveL>(handle, 0.3F, "sending_follow");
+    complete_follow_action<MoveL>(handle, follow_goal, "movel");
+  }
+
+  void log_trajectory_summary(
+    const std::string & tag, const trajectory_msgs::msg::JointTrajectory & trajectory) const
+  {
+    std::string joints;
+    for (size_t i = 0; i < trajectory.joint_names.size(); ++i) {
+      if (i > 0) {
+        joints += ",";
+      }
+      joints += trajectory.joint_names[i];
+    }
+    const auto & first = trajectory.points.front();
+    const auto & last = trajectory.points.back();
+    const double duration = rclcpp::Duration(last.time_from_start).seconds();
+    RCLCPP_INFO(
+      get_logger(),
+      "%s trajectory: joints=[%s] points=%zu duration=%.3fs "
+      "first_has_vel=%d last_has_vel=%d stamp_sec=%d stamp_nanosec=%u",
+      tag.c_str(), joints.c_str(), trajectory.points.size(), duration,
+      first.velocities.empty() ? 0 : 1, last.velocities.empty() ? 0 : 1,
+      trajectory.header.stamp.sec, trajectory.header.stamp.nanosec);
+    if (!first.positions.empty() && !last.positions.empty()) {
+      RCLCPP_INFO(
+        get_logger(),
+        "%s trajectory ends: first_q0=%.4f last_q0=%.4f delta_q0=%.4f",
+        tag.c_str(), first.positions.front(), last.positions.front(),
+        last.positions.front() - first.positions.front());
+    }
   }
 
   void execute_movejs(const std::shared_ptr<GoalHandleMoveJs> handle)
@@ -785,17 +953,68 @@ private:
     handle->publish_feedback(feedback);
   }
 
+  // Wait on an rclcpp future with periodic logs so a hang is visible in journal.
+  template<typename FutureT>
+  std::future_status wait_future_logged(
+    FutureT & future, double timeout_sec, const std::string & stage)
+  {
+    const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(timeout_sec));
+    auto next_log = std::chrono::steady_clock::now();
+    while (rclcpp::ok()) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        RCLCPP_ERROR(
+          get_logger(), "follow wait TIMEOUT at stage=%s after %.1fs",
+          stage.c_str(), timeout_sec);
+        return std::future_status::timeout;
+      }
+      if (now >= next_log) {
+        const double remain = std::chrono::duration<double>(deadline - now).count();
+        RCLCPP_INFO(
+          get_logger(), "follow waiting stage=%s remain=%.1fs still_frames=%d stop=%d",
+          stage.c_str(), remain, still_frames_.load(), stop_requested_.load() ? 1 : 0);
+        next_log = now + 1s;
+      }
+      const auto slice = std::min(
+        std::chrono::duration<double>(0.2),
+        std::chrono::duration<double>(deadline - now));
+      const auto status = future.wait_for(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(slice));
+      if (status == std::future_status::ready) {
+        RCLCPP_INFO(get_logger(), "follow wait READY at stage=%s", stage.c_str());
+        return status;
+      }
+      if (stop_requested_.load()) {
+        RCLCPP_WARN(get_logger(), "follow wait interrupted by stop at stage=%s", stage.c_str());
+        return std::future_status::timeout;
+      }
+    }
+    return std::future_status::timeout;
+  }
+
   template<typename ActionT, typename GoalHandleT>
   void complete_follow_action(
     const std::shared_ptr<GoalHandleT> handle, const Follow::Goal & goal,
     const std::string & command)
   {
+    RCLCPP_INFO(
+      get_logger(),
+      "%s follow: waiting for action server '%s' (timeout=%.1fs)",
+      command.c_str(), follow_action_name_.c_str(), operation_timeout_);
     if (!follow_client_->wait_for_action_server(std::chrono::duration<double>(operation_timeout_))) {
+      RCLCPP_ERROR(
+        get_logger(), "%s follow: action server unavailable: %s",
+        command.c_str(), follow_action_name_.c_str());
       complete_action<ActionT>(handle, false, command, "trajectory controller unavailable");
       return;
     }
+    RCLCPP_INFO(
+      get_logger(), "%s follow: sending goal points=%zu",
+      command.c_str(), goal.trajectory.points.size());
     auto send_future = follow_client_->async_send_goal(goal);
-    if (send_future.wait_for(std::chrono::duration<double>(operation_timeout_)) !=
+    if (wait_future_logged(send_future, operation_timeout_, command + "/send_goal") !=
       std::future_status::ready)
     {
       complete_action<ActionT>(handle, false, command, "trajectory goal timeout");
@@ -803,24 +1022,38 @@ private:
     }
     auto follow_handle = send_future.get();
     if (!follow_handle) {
+      RCLCPP_ERROR(get_logger(), "%s follow: goal REJECTED by controller", command.c_str());
       complete_action<ActionT>(handle, false, command, "trajectory goal rejected");
       return;
     }
+    RCLCPP_INFO(
+      get_logger(), "%s follow: goal ACCEPTED, waiting for result (timeout=%.1fs)",
+      command.c_str(), motion_timeout_);
+    publish_feedback<ActionT>(handle, 0.5F, "follow_executing");
     {
       std::lock_guard<std::mutex> lock(follow_mutex_);
       active_follow_goal_ = follow_handle;
     }
     auto result_future = follow_client_->async_get_result(follow_handle);
-    const auto status = result_future.wait_for(std::chrono::duration<double>(motion_timeout_));
+    const auto status = wait_future_logged(
+      result_future, motion_timeout_, command + "/get_result");
     bool backend_ok = false;
     std::string detail = command;
     if (status == std::future_status::ready) {
       const auto wrapped = result_future.get();
+      const int error_code = wrapped.result ? wrapped.result->error_code : -1;
       backend_ok = wrapped.result &&
         wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
         wrapped.result->error_code == Follow::Result::SUCCESSFUL;
       detail = wrapped.result ? wrapped.result->error_string : "trajectory returned no result";
+      RCLCPP_INFO(
+        get_logger(),
+        "%s follow: result ready ok=%d result_code=%d error_code=%d detail=%s",
+        command.c_str(), backend_ok ? 1 : 0, static_cast<int>(wrapped.code),
+        error_code, detail.c_str());
     } else {
+      RCLCPP_ERROR(
+        get_logger(), "%s follow: result TIMEOUT, canceling goal", command.c_str());
       follow_client_->async_cancel_goal(follow_handle);
       detail = "trajectory result timeout";
     }
@@ -836,6 +1069,11 @@ private:
     const std::shared_ptr<GoalHandleT> handle, bool backend_ok,
     const std::string & command, const std::string & detail = "")
   {
+    RCLCPP_INFO(
+      get_logger(),
+      "%s complete_action: backend_ok=%d detail=%s stop=%d canceling=%d still_frames=%d",
+      command.c_str(), backend_ok ? 1 : 0, detail.c_str(),
+      stop_requested_.load() ? 1 : 0, handle->is_canceling() ? 1 : 0, still_frames_.load());
     auto result = std::make_shared<typename ActionT::Result>();
     if (handle->is_canceling() || stop_requested_.load()) {
       result->success = true;
@@ -858,7 +1096,13 @@ private:
       return;
     }
     still_frames_.store(0);
+    RCLCPP_INFO(get_logger(), "%s waiting for still (timeout=%.1fs)", command.c_str(), motion_timeout_);
+    publish_feedback<ActionT>(handle, 0.9F, "waiting_still");
     if (!wait_still()) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "%s wait_still FAILED still_frames=%d stop=%d",
+        command.c_str(), still_frames_.load(), stop_requested_.load() ? 1 : 0);
       if (stop_requested_.load() || handle->is_canceling()) {
         complete_action<ActionT>(handle, true, command, "motion stopped");
         return;
@@ -870,6 +1114,7 @@ private:
       handle->abort(result);
       return;
     }
+    RCLCPP_INFO(get_logger(), "%s succeeded", command.c_str());
     result->success = true;
     result->code = 0;
     result->message = "ok";
@@ -977,6 +1222,7 @@ private:
   rclcpp::Service<pi_arm_interfaces::srv::ManageMotor>::SharedPtr zero_service_;
   rclcpp::Service<pi_arm_interfaces::srv::StopMotion>::SharedPtr stop_service_;
   rclcpp::CallbackGroup::SharedPtr service_group_;
+  rclcpp::CallbackGroup::SharedPtr action_group_;
   rclcpp_action::Server<MoveJ>::SharedPtr movej_server_;
   rclcpp_action::Server<MoveJs>::SharedPtr movejs_server_;
   rclcpp_action::Server<MoveL>::SharedPtr movel_server_;
@@ -996,7 +1242,8 @@ int main(int argc, char ** argv)
     rclcpp::shutdown();
     return 1;
   }
-  rclcpp::executors::MultiThreadedExecutor executor;
+  rclcpp::executors::MultiThreadedExecutor executor(
+    rclcpp::ExecutorOptions(), std::max(4U, std::thread::hardware_concurrency()));
   executor.add_node(node);
   executor.spin();
   rclcpp::shutdown();

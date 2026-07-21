@@ -150,7 +150,10 @@ def generate_launch_description():
             Node(
                 package="pi_arm_manager",
                 executable="pi_arm_manager_node",
-                name="pi_arm_manager",
+                # Do not set name= here. MoveGroupInterface creates a second
+                # rclcpp::Node inside this process; launch's name remapping would
+                # rename both to pi_arm_manager and produce a duplicate graph entry.
+                # The C++ node is already constructed as Node("pi_arm_manager").
                 output="screen",
                 parameters=[
                     robot_description,

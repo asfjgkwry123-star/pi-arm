@@ -8,7 +8,7 @@ def generate_launch_description() -> LaunchDescription:
             Node(
                 package="pi_arm_manager",
                 executable="pi_arm_manager_node",
-                name="pi_arm_manager",
+                # Avoid launch name remapping; see bringup.launch.py comment.
                 output="screen",
             )
         ]

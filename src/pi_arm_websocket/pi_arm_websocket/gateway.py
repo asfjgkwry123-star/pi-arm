@@ -62,20 +62,21 @@ class RosBridge(Node):
         self.default_joint_names = list(self.get_parameter("joint_names").value)
         self._state: RobotState | None = None
         self._state_lock = threading.Lock()
-        self._active_goals: set[Any] = set()
+        # ClientGoalHandle is unhashable in Jazzy rclpy; track with a list.
+        self._active_goals: list[Any] = []
         self._goal_lock = threading.Lock()
 
         self.create_subscription(RobotState, "/pi_arm/state", self._on_state, 10)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.services = {
+        self.service_clients = {
             "enable_motor": self.create_client(ManageMotor, "/pi_arm/enable_motor"),
             "disable_motor": self.create_client(ManageMotor, "/pi_arm/disable_motor"),
             "reset_motor": self.create_client(ManageMotor, "/pi_arm/reset_motor"),
             "set_zero": self.create_client(ManageMotor, "/pi_arm/set_zero"),
             "stop_motion": self.create_client(StopMotion, "/pi_arm/stop_motion"),
         }
-        self.actions = {
+        self.action_clients = {
             "movej": ActionClient(self, MoveJ, "/pi_arm/movej"),
             "movejs": ActionClient(self, MoveJs, "/pi_arm/movejs"),
             "movel": ActionClient(self, MoveL, "/pi_arm/movel"),
@@ -102,7 +103,7 @@ class RosBridge(Node):
         return future.result()
 
     async def call_service(self, command: str, request: Any) -> Any:
-        client = self.services[command]
+        client = self.service_clients[command]
         available = await asyncio.to_thread(client.wait_for_service, self.timeout)
         if not available:
             raise ProtocolError(CODE_STATE_UNAVAILABLE, "manager 服务不可用")
@@ -120,7 +121,7 @@ class RosBridge(Node):
             raise ProtocolError(CODE_MOTION_BUSY, "已有运动任务正在运行")
         if state.state != RobotState.READY:
             raise ProtocolError(CODE_STATE_UNAVAILABLE, f"当前状态不允许运动: {state.state_name}")
-        client = self.actions[action_name]
+        client = self.action_clients[action_name]
         available = await asyncio.to_thread(client.wait_for_server, self.timeout)
         if not available:
             raise ProtocolError(CODE_STATE_UNAVAILABLE, "manager action 不可用")
@@ -137,13 +138,16 @@ class RosBridge(Node):
         )
         if not goal_handle.accepted:
             raise ProtocolError(CODE_MOTION_BUSY, "运动目标被拒绝")
-        with self._goal_lock:
-            self._active_goals.add(goal_handle)
         result_future = goal_handle.get_result_async()
+        with self._goal_lock:
+            self._active_goals.append(goal_handle)
 
         def release(_: Any) -> None:
             with self._goal_lock:
-                self._active_goals.discard(goal_handle)
+                try:
+                    self._active_goals.remove(goal_handle)
+                except ValueError:
+                    pass
 
         result_future.add_done_callback(release)
         received = await asyncio.to_thread(feedback_ready.wait, self.timeout)
