@@ -279,7 +279,7 @@ private:
   {
     return create_service<pi_arm_interfaces::srv::ManageMotor>(
       name,
-      [this, client, operation](
+      [this, client, operation, name](
         const std::shared_ptr<pi_arm_interfaces::srv::ManageMotor::Request> request,
         std::shared_ptr<pi_arm_interfaces::srv::ManageMotor::Response> response)
       {
@@ -309,12 +309,19 @@ private:
           response->success = false;
           response->code = 2001;
           response->message = "operation rejected by robot state";
+          RCLCPP_WARN(
+            get_logger(),
+            "service %s REJECTED: motor_id=%d state=%s still=%d task_claimed=%d",
+            name.c_str(), request->motor_id, state_name(state),
+            still ? 1 : 0, task_claimed_.load() ? 1 : 0);
           return;
         }
         if (!client->wait_for_service(std::chrono::duration<double>(operation_timeout_))) {
           response->success = false;
           response->code = 2002;
           response->message = "hardware service unavailable";
+          RCLCPP_ERROR(
+            get_logger(), "service %s FAILED: hardware backend unavailable", name.c_str());
           return;
         }
         auto future = client->async_send_request(request);
@@ -324,9 +331,20 @@ private:
           response->success = false;
           response->code = 2002;
           response->message = "hardware service timeout";
+          RCLCPP_ERROR(
+            get_logger(), "service %s FAILED: hardware backend timeout", name.c_str());
           return;
         }
         *response = *future.get();
+        if (response->success) {
+          RCLCPP_INFO(
+            get_logger(), "service %s ok: motor_id=%d message=%s",
+            name.c_str(), request->motor_id, response->message.c_str());
+        } else {
+          RCLCPP_WARN(
+            get_logger(), "service %s backend failed: motor_id=%d code=%d message=%s",
+            name.c_str(), request->motor_id, response->code, response->message.c_str());
+        }
       },
       rmw_qos_profile_services_default, service_group_);
   }
@@ -357,6 +375,9 @@ private:
         state == pi_arm_interfaces::msg::RobotState::DISABLED);
     }
     if (stop_for_hardware) {
+      RCLCPP_WARN(
+        get_logger(),
+        "stopping active task due to hardware state change (disconnected/fault/disabled)");
       request_stop();
     }
   }
@@ -403,14 +424,29 @@ private:
   bool claim_goal(const std::string & command)
   {
     std::lock_guard<std::mutex> command_lock(command_mutex_);
-    if (current_state() != pi_arm_interfaces::msg::RobotState::READY) {
+    const auto state = current_state();
+    if (state != pi_arm_interfaces::msg::RobotState::READY) {
+      RCLCPP_WARN(
+        get_logger(), "%s REJECTED: robot not READY (state=%s still_frames=%d task_claimed=%d)",
+        command.c_str(), state_name(state), still_frames_.load(),
+        task_claimed_.load() ? 1 : 0);
       return false;
     }
     bool expected = false;
     if (!task_claimed_.compare_exchange_strong(expected, true)) {
+      RCLCPP_WARN(
+        get_logger(), "%s REJECTED: another task is already claimed", command.c_str());
       return false;
     }
     begin_task(command);
+    uint64_t task_id = 0;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      task_id = task_.task_id;
+    }
+    RCLCPP_INFO(
+      get_logger(), "%s ACCEPTED: task_id=%lu",
+      command.c_str(), static_cast<unsigned long>(task_id));
     return true;
   }
 
@@ -429,14 +465,31 @@ private:
 
   void finish_task(uint8_t status, int32_t code, const std::string & message)
   {
+    uint64_t task_id = 0;
+    std::string command;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
+      task_id = task_.task_id;
+      command = task_.command;
       task_.status = status;
       task_.progress = status == pi_arm_interfaces::msg::TaskState::SUCCEEDED ? 1.0F : task_.progress;
       task_.code = code;
       task_.message = message;
     }
     task_claimed_.store(false);
+    if (status == pi_arm_interfaces::msg::TaskState::SUCCEEDED) {
+      RCLCPP_INFO(
+        get_logger(), "task finished ok: id=%lu cmd=%s",
+        static_cast<unsigned long>(task_id), command.c_str());
+    } else if (status == pi_arm_interfaces::msg::TaskState::CANCELED) {
+      RCLCPP_WARN(
+        get_logger(), "task canceled: id=%lu cmd=%s message=%s",
+        static_cast<unsigned long>(task_id), command.c_str(), message.c_str());
+    } else {
+      RCLCPP_ERROR(
+        get_logger(), "task failed: id=%lu cmd=%s code=%d message=%s",
+        static_cast<unsigned long>(task_id), command.c_str(), code, message.c_str());
+    }
   }
 
   bool wait_still()
@@ -585,6 +638,11 @@ private:
       !std::isfinite(goal->max_acceleration) || goal->max_acceleration <= 0.0 ||
       goal->max_acceleration > min_acceleration_limit(goal->joint_names) + 1e-6)
     {
+      RCLCPP_WARN(
+        get_logger(),
+        "movej REJECTED: invalid goal (joints=%zu max_v=%.6f max_a=%.6f a_limit=%.6f)",
+        goal->joint_names.size(), goal->max_velocity, goal->max_acceleration,
+        min_acceleration_limit(goal->joint_names));
       return rclcpp_action::GoalResponse::REJECT;
     }
     return claim_goal("movej") ? rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE :
@@ -595,6 +653,10 @@ private:
     const rclcpp_action::GoalUUID &, std::shared_ptr<const MoveJs::Goal> goal)
   {
     if (!valid_trajectory(goal->trajectory)) {
+      RCLCPP_WARN(
+        get_logger(),
+        "movejs REJECTED: invalid trajectory (joints=%zu points=%zu)",
+        goal->trajectory.joint_names.size(), goal->trajectory.points.size());
       return rclcpp_action::GoalResponse::REJECT;
     }
     return claim_goal("movejs") ? rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE :
@@ -609,19 +671,43 @@ private:
     const double quaternion_norm =
       orientation.x * orientation.x + orientation.y * orientation.y +
       orientation.z * orientation.z + orientation.w * orientation.w;
+    const char * reason = nullptr;
     if (!std::isfinite(goal->max_linear_velocity) || goal->max_linear_velocity <= 0.0 ||
-      goal->max_linear_velocity > linear_velocity_limit_ + 1e-6 ||
-      !std::isfinite(goal->max_linear_acceleration) || goal->max_linear_acceleration <= 0.0 ||
-      goal->max_linear_acceleration > linear_acceleration_limit_ + 1e-6 ||
-      !std::isfinite(goal->max_angular_velocity) || goal->max_angular_velocity <= 0.0 ||
-      goal->max_angular_velocity > angular_velocity_limit_ + 1e-6 ||
-      !std::isfinite(goal->max_angular_acceleration) || goal->max_angular_acceleration <= 0.0 ||
-      goal->max_angular_acceleration > angular_acceleration_limit_ + 1e-6 ||
-      !std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z) ||
+      goal->max_linear_velocity > linear_velocity_limit_ + 1e-6)
+    {
+      reason = "invalid or out-of-range max_linear_velocity";
+    } else if (!std::isfinite(goal->max_linear_acceleration) ||
+      goal->max_linear_acceleration <= 0.0 ||
+      goal->max_linear_acceleration > linear_acceleration_limit_ + 1e-6)
+    {
+      reason = "invalid or out-of-range max_linear_acceleration";
+    } else if (!std::isfinite(goal->max_angular_velocity) || goal->max_angular_velocity <= 0.0 ||
+      goal->max_angular_velocity > angular_velocity_limit_ + 1e-6)
+    {
+      reason = "invalid or out-of-range max_angular_velocity";
+    } else if (!std::isfinite(goal->max_angular_acceleration) ||
+      goal->max_angular_acceleration <= 0.0 ||
+      goal->max_angular_acceleration > angular_acceleration_limit_ + 1e-6)
+    {
+      reason = "invalid or out-of-range max_angular_acceleration";
+    } else if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+      !std::isfinite(position.z) ||
       !std::isfinite(orientation.x) || !std::isfinite(orientation.y) ||
       !std::isfinite(orientation.z) || !std::isfinite(orientation.w) ||
       std::abs(quaternion_norm - 1.0) > 1e-3)
     {
+      reason = "invalid target pose / quaternion";
+    }
+    if (reason != nullptr) {
+      RCLCPP_WARN(
+        get_logger(),
+        "movel REJECTED: %s target=(%.4f,%.4f,%.4f) lin_v=%.6f lin_a=%.6f "
+        "ang_v=%.6f ang_a=%.6f quat_norm=%.6f limits lin_v=%.6f lin_a=%.6f ang_v=%.6f ang_a=%.6f",
+        reason, position.x, position.y, position.z,
+        goal->max_linear_velocity, goal->max_linear_acceleration,
+        goal->max_angular_velocity, goal->max_angular_acceleration, quaternion_norm,
+        linear_velocity_limit_, linear_acceleration_limit_,
+        angular_velocity_limit_, angular_acceleration_limit_);
       return rclcpp_action::GoalResponse::REJECT;
     }
     return claim_goal("movel") ? rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE :
@@ -632,6 +718,10 @@ private:
     const rclcpp_action::GoalUUID &, std::shared_ptr<const DirectMove::Goal> goal)
   {
     if (!valid_joint_goal(goal->joint_names, goal->positions, goal->max_velocity)) {
+      RCLCPP_WARN(
+        get_logger(),
+        "direct_move REJECTED: invalid goal (joints=%zu max_v=%.6f)",
+        goal->joint_names.size(), goal->max_velocity);
       return rclcpp_action::GoalResponse::REJECT;
     }
     return claim_goal("direct_move") ? rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE :
@@ -641,6 +731,7 @@ private:
   template<typename GoalHandleT>
   rclcpp_action::CancelResponse cancel_common(const std::shared_ptr<GoalHandleT>)
   {
+    RCLCPP_WARN(get_logger(), "motion cancel requested");
     request_stop();
     return rclcpp_action::CancelResponse::ACCEPT;
   }
@@ -670,6 +761,7 @@ private:
         try {
           self->execute_movej(goal);
         } catch (const std::exception & error) {
+          RCLCPP_ERROR(self->get_logger(), "movej exception: %s", error.what());
           self->complete_action<MoveJ>(goal, false, "movej", error.what());
         }
       }).detach();
@@ -682,6 +774,7 @@ private:
         try {
           self->execute_movejs(goal);
         } catch (const std::exception & error) {
+          RCLCPP_ERROR(self->get_logger(), "movejs exception: %s", error.what());
           self->complete_action<MoveJs>(goal, false, "movejs", error.what());
         }
       }).detach();
@@ -694,6 +787,7 @@ private:
         try {
           self->execute_movel(goal);
         } catch (const std::exception & error) {
+          RCLCPP_ERROR(self->get_logger(), "movel exception: %s", error.what());
           self->complete_action<MoveL>(goal, false, "movel", error.what());
         }
       }).detach();
@@ -706,6 +800,7 @@ private:
         try {
           self->execute_direct(goal);
         } catch (const std::exception & error) {
+          RCLCPP_ERROR(self->get_logger(), "direct_move exception: %s", error.what());
           self->complete_action<DirectMove>(goal, false, "direct_move", error.what());
         }
       }).detach();
@@ -1033,6 +1128,9 @@ private:
       result->success = false;
       result->code = 3001;
       result->message = detail.empty() ? command + " backend failed" : detail;
+      RCLCPP_ERROR(
+        get_logger(), "%s aborted: code=%d message=%s",
+        command.c_str(), result->code, result->message.c_str());
       finish_task(pi_arm_interfaces::msg::TaskState::FAILED, result->code, result->message);
       handle->abort(result);
       return;
@@ -1112,11 +1210,13 @@ private:
     std::shared_ptr<pi_arm_interfaces::srv::StopMotion::Response> response)
   {
     if (!task_claimed_.load()) {
+      RCLCPP_INFO(get_logger(), "stop_motion: no active motion");
       response->success = true;
       response->code = 0;
       response->message = "no active motion";
       return;
     }
+    RCLCPP_WARN(get_logger(), "stop_motion: requesting stop of active task");
     request_stop();
     response->success = true;
     response->code = 0;

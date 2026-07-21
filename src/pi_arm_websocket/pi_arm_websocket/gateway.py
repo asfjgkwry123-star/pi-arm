@@ -96,35 +96,52 @@ class RosBridge(Node):
         future.add_done_callback(lambda _: completed.set())
         ok = await asyncio.to_thread(completed.wait, timeout or self.timeout)
         if not ok:
+            self.get_logger().error(f"ROS future 超时 ({timeout or self.timeout:.1f}s)")
             raise ProtocolError(CODE_COMMAND_FAILED, "ROS 请求超时")
         exception = future.exception()
         if exception is not None:
+            self.get_logger().error(f"ROS future 失败: {exception}")
             raise ProtocolError(CODE_COMMAND_FAILED, f"ROS 请求失败: {exception}")
         return future.result()
 
     async def call_service(self, command: str, request: Any) -> Any:
         client = self.service_clients[command]
+        self.get_logger().info(f"调用服务 {command}")
         available = await asyncio.to_thread(client.wait_for_service, self.timeout)
         if not available:
+            self.get_logger().error(f"服务不可用: {command}")
             raise ProtocolError(CODE_STATE_UNAVAILABLE, "manager 服务不可用")
         result = await self.wait_future(client.call_async(request))
         if not result.success:
             code = int(result.code) if result.code else CODE_COMMAND_FAILED
+            self.get_logger().warning(
+                f"服务返回失败: cmd={command} code={code} message={result.message}"
+            )
             raise ProtocolError(code, result.message)
+        self.get_logger().info(f"服务成功: {command}")
         return result
 
     async def send_goal(self, action_name: str, goal: Any) -> int:
         state = self.state_snapshot()
         if state is None:
+            self.get_logger().warning(f"action {action_name} 拒绝: 状态尚未就绪")
             raise ProtocolError(CODE_STATE_UNAVAILABLE, "机械臂状态尚未就绪")
         if state.state == RobotState.RUNNING:
+            self.get_logger().warning(
+                f"action {action_name} 拒绝: 忙 (task={state.task.command}/{state.task.task_id})"
+            )
             raise ProtocolError(CODE_MOTION_BUSY, "已有运动任务正在运行")
         if state.state != RobotState.READY:
+            self.get_logger().warning(
+                f"action {action_name} 拒绝: 状态={state.state_name}"
+            )
             raise ProtocolError(CODE_STATE_UNAVAILABLE, f"当前状态不允许运动: {state.state_name}")
         client = self.action_clients[action_name]
         available = await asyncio.to_thread(client.wait_for_server, self.timeout)
         if not available:
+            self.get_logger().error(f"action server 不可用: {action_name}")
             raise ProtocolError(CODE_STATE_UNAVAILABLE, "manager action 不可用")
+        self.get_logger().info(f"发送 action goal: {action_name}")
         feedback_ready = threading.Event()
         task_id_box: list[int] = []
 
@@ -137,6 +154,7 @@ class RosBridge(Node):
             client.send_goal_async(goal, feedback_callback=feedback_callback)
         )
         if not goal_handle.accepted:
+            self.get_logger().warning(f"action goal 被 manager 拒绝: {action_name}")
             raise ProtocolError(CODE_MOTION_BUSY, "运动目标被拒绝")
         result_future = goal_handle.get_result_async()
         with self._goal_lock:
@@ -152,7 +170,9 @@ class RosBridge(Node):
         result_future.add_done_callback(release)
         received = await asyncio.to_thread(feedback_ready.wait, self.timeout)
         if not received:
+            self.get_logger().error(f"action {action_name} 未在超时内返回 task_id")
             raise ProtocolError(CODE_COMMAND_FAILED, "manager 未返回任务 ID")
+        self.get_logger().info(f"action {action_name} 已接受: task_id={task_id_box[0]}")
         return task_id_box[0]
 
 
@@ -160,17 +180,38 @@ class CommandGateway:
     def __init__(self, bridge: RosBridge) -> None:
         self.bridge = bridge
 
+    @staticmethod
+    def _params_for_log(params: dict[str, Any]) -> Any:
+        """Avoid flooding logs with large movejs target arrays."""
+        targets = params.get("targets")
+        if isinstance(targets, list) and len(targets) > 8:
+            summary = dict(params)
+            summary["targets"] = f"<{len(targets)} points>"
+            return summary
+        return params
+
     async def handle(self, raw: str) -> str:
         msg_id = 0
         try:
             request = parse_request(raw)
             msg_id = request.msg_id
+            self.bridge.get_logger().info(
+                f"WS 请求: msg_id={msg_id} cmd={request.command} "
+                f"params={self._params_for_log(request.params)}"
+            )
             data = await self.dispatch(request)
+            self.bridge.get_logger().info(
+                f"WS 响应成功: msg_id={msg_id} cmd={request.command} data={data}"
+            )
             return response(msg_id, 0, "ok", data)
         except ProtocolError as exc:
+            self.bridge.get_logger().warning(
+                f"WS 协议/业务失败: msg_id={exc.msg_id or msg_id} "
+                f"code={exc.code} message={exc.message}"
+            )
             return response(exc.msg_id or msg_id, exc.code, exc.message)
         except Exception as exc:  # Keep the wire protocol stable at the process boundary.
-            self.bridge.get_logger().error(f"命令处理失败: {exc}")
+            self.bridge.get_logger().error(f"WS 未处理异常: msg_id={msg_id} error={exc}")
             return response(msg_id, CODE_COMMAND_FAILED, f"命令执行失败: {exc}")
 
     async def dispatch(self, request: Request) -> dict[str, Any]:
@@ -342,6 +383,9 @@ class WebSocketGateway:
         self.counter = count(1)
 
     async def run(self) -> None:
+        self.bridge.get_logger().info(
+            f"WebSocket 网关监听 ws://{self.bridge.host}:{self.bridge.port}"
+        )
         async with websockets.serve(
             self._client,
             self.bridge.host,
@@ -352,16 +396,33 @@ class WebSocketGateway:
         ):
             await self._push_loop()
 
+    def _peer(self, websocket: Any) -> str:
+        remote = getattr(websocket, "remote_address", None)
+        if isinstance(remote, tuple) and len(remote) >= 2:
+            return f"{remote[0]}:{remote[1]}"
+        return str(remote or "unknown")
+
     async def _client(self, websocket: Any) -> None:
+        peer = self._peer(websocket)
         self.clients.add(websocket)
+        self.bridge.get_logger().info(
+            f"WebSocket 客户端接入: {peer} (连接数={len(self.clients)})"
+        )
         try:
             async for message in websocket:
                 raw = message if isinstance(message, str) else "{}"
                 await websocket.send(await self.commands.handle(raw))
-        except ConnectionClosed:
-            return
+        except ConnectionClosed as exc:
+            self.bridge.get_logger().info(
+                f"WebSocket 连接关闭: {peer} code={exc.code} reason={exc.reason!r}"
+            )
+        except Exception as exc:
+            self.bridge.get_logger().error(f"WebSocket 客户端异常: {peer} error={exc}")
         finally:
             self.clients.discard(websocket)
+            self.bridge.get_logger().info(
+                f"WebSocket 客户端离开: {peer} (连接数={len(self.clients)})"
+            )
 
     async def _push_loop(self) -> None:
         while rclpy.ok():
