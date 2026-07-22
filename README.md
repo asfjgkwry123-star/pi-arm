@@ -41,6 +41,8 @@ ros2 launch pi_arm_bringup bringup.launch.py \
   hardware_type:=real can_interface:=can0 bitrate:=1000000
 ```
 
+真机启动安全：电机可先上电（即使驱动自动使能）。硬件层在反馈首次全部 `fresh` 后一次性把 `command` hold 到实测角（之后由控制器接管，轨迹运行期间不再每拍 hold）；且仅在全关节使能且反馈新鲜时进入位置控制。不会把 command 缓冲初值 0 当作目标下发。
+
 仅检查模型：
 
 ```bash

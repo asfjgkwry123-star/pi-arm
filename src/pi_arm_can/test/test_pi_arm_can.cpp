@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace
@@ -20,6 +21,12 @@ TEST(Protocol, EncodesPositionControlPayloadLittleEndian)
   const std::array<std::uint8_t, 8> expected{
     0xA4, 0x00, 0x41, 0x01, 0xC7, 0xCF, 0xFF, 0xFF};
   EXPECT_EQ(frame.data, expected);
+}
+
+TEST(Protocol, RejectsSpeedThatRoundsToZero)
+{
+  EXPECT_THROW(
+    pi_arm_can::make_position_command(1U, 0.0, 0.4), std::out_of_range);
 }
 
 TEST(Protocol, DecodesSigned56BitLimits)

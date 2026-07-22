@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "rclcpp/clock.hpp"
@@ -86,9 +88,37 @@ std::vector<std::uint8_t> selected_motor_ids(
 
 }  // namespace
 
+double resolve_motor_speed_dps(
+  const double commanded_joint_velocity_rad_s,
+  const double joint_velocity_limit_rad_s,
+  const pi_arm_can::Transmission & transmission,
+  const std::size_t joint_index)
+{
+  double joint_speed = std::abs(commanded_joint_velocity_rad_s);
+  if (joint_speed < kMinCommandedJointSpeedRadS) {
+    joint_speed = joint_velocity_limit_rad_s;
+  }
+  double motor_dps = std::abs(
+    transmission.joint_velocity_to_motor(joint_speed * kDegreesPerRadian));
+  if (!std::isfinite(motor_dps)) {
+    log_write_warn(
+      "write motor speed non-finite at joint[%zu]; using protocol minimum %.0f dps",
+      joint_index, kMinMotorSpeedDps);
+    return kMinMotorSpeedDps;
+  }
+  if (motor_dps < kMinMotorSpeedDps || motor_dps > kMaxMotorSpeedDps) {
+    log_write_warn(
+      "write motor speed clamped at joint[%zu]: dps=%.6g -> [%.0f, %.0f]",
+      joint_index, motor_dps, kMinMotorSpeedDps, kMaxMotorSpeedDps);
+    motor_dps = std::clamp(motor_dps, kMinMotorSpeedDps, kMaxMotorSpeedDps);
+  }
+  return motor_dps;
+}
+
 RealBackend::RealBackend(BackendConfig config)
 : config_(std::move(config)), transmissions_(config_.transmissions)
 {
+  last_positions_rad_.assign(config_.transmissions.size(), 0.0);
 }
 
 RealBackend::~RealBackend()
@@ -111,6 +141,15 @@ void RealBackend::activate()
 {
   if (!driver_ || !driver_->running()) {
     throw std::runtime_error("CAN driver is not running");
+  }
+  // configure() already starts the poll threads; a SocketCAN I/O failure there
+  // can leave mode=FAULT while running_ is still true. Reject early so
+  // controller_manager does not activate then immediately tear down on write().
+  if (driver_->mode() == pi_arm_can::DriverMode::FAULT) {
+    const auto detail = driver_->last_error();
+    throw std::runtime_error(
+            detail.empty() ? "CAN driver is in FAULT" :
+            ("CAN driver is in FAULT: " + detail));
   }
 }
 
@@ -138,7 +177,8 @@ bool RealBackend::read(HardwareSample & sample) noexcept
     const auto snapshot = driver_->snapshot();
     const auto now = std::chrono::steady_clock::now();
     const std::size_t count = config_.transmissions.size();
-    sample.positions_rad.assign(count, 0.0);
+    // Seed from last valid angles so missing angle_valid never invents 0.0 feedback.
+    sample.positions_rad = last_positions_rad_;
     sample.velocities_rad_s.assign(count, 0.0);
     sample.enabled.assign(count, false);
     sample.has_error.assign(count, false);
@@ -158,6 +198,7 @@ bool RealBackend::read(HardwareSample & sample) noexcept
       if (state.angle_valid) {
         sample.positions_rad[index] =
           transmission.motor_position_to_joint(state.angle_deg) / kDegreesPerRadian;
+        last_positions_rad_[index] = sample.positions_rad[index];
       }
       if (state.status2_valid) {
         sample.velocities_rad_s[index] =
@@ -183,10 +224,19 @@ bool RealBackend::read(HardwareSample & sample) noexcept
       std::all_of(sample.enabled.begin(), sample.enabled.end(), [](const bool value) {
         return value;
       });
-    if (driver_->mode() == pi_arm_can::DriverMode::MONITORING && all_enabled) {
+    const bool all_fresh =
+      !sample.fresh.empty() &&
+      std::all_of(sample.fresh.begin(), sample.fresh.end(), [](const bool value) {
+        return value;
+      });
+    // Enter CONTROL only when motors are enabled AND feedback is fresh so the
+    // command buffer can be held to measured state before any position frame.
+    if (driver_->mode() == pi_arm_can::DriverMode::MONITORING && all_enabled && all_fresh) {
       driver_->set_mode(pi_arm_can::DriverMode::CONTROL);
       sample.driver_mode = pi_arm_can::to_string(driver_->mode());
-    } else if (driver_->mode() == pi_arm_can::DriverMode::CONTROL && !all_enabled) {
+    } else if (driver_->mode() == pi_arm_can::DriverMode::CONTROL &&
+      (!all_enabled || !all_fresh))
+    {
       driver_->set_mode(pi_arm_can::DriverMode::MONITORING);
       sample.driver_mode = pi_arm_can::to_string(driver_->mode());
     }
@@ -213,15 +263,21 @@ bool RealBackend::write(
       config_.transmissions.size());
     return false;
   }
-  if (driver_->mode() == pi_arm_can::DriverMode::MONITORING ||
-    driver_->mode() == pi_arm_can::DriverMode::EXCLUSIVE_MANAGEMENT)
+  const auto mode = driver_->mode();
+  // Intentional non-commanding modes: do not send position frames, but keep the
+  // ros2_control write cycle healthy (returning false deactivates the hardware).
+  if (mode == pi_arm_can::DriverMode::MONITORING ||
+    mode == pi_arm_can::DriverMode::EXCLUSIVE_MANAGEMENT)
   {
     return true;
   }
-  if (driver_->mode() != pi_arm_can::DriverMode::CONTROL) {
+  if (mode != pi_arm_can::DriverMode::CONTROL) {
+    const auto detail = driver_->last_error();
     log_write_reject(
-      "write rejected: driver mode is not CONTROL (mode=%d)",
-      static_cast<int>(driver_->mode()));
+      "write rejected: driver mode is %s (%d)%s%s",
+      pi_arm_can::to_string(mode), static_cast<int>(mode),
+      detail.empty() ? "" : ": ",
+      detail.empty() ? "" : detail.c_str());
     return false;
   }
   try {
@@ -247,15 +303,13 @@ bool RealBackend::write(
         velocities_rad_s[index], config_.joint_velocity_limits_rad_s[index], index);
       const auto & transmission = transmissions_.by_joint_id(
         config_.transmissions[index].joint_id);
-      double requested_speed = std::abs(commanded_velocity);
-      if (requested_speed < std::numeric_limits<double>::epsilon()) {
-        requested_speed = config_.joint_velocity_limits_rad_s[index];
-      }
       commands.push_back(
         pi_arm_can::PositionCommand{
           transmission.config().motor_id,
           transmission.joint_position_to_motor(positions_rad[index] * kDegreesPerRadian),
-          std::abs(transmission.joint_velocity_to_motor(requested_speed * kDegreesPerRadian))});
+          resolve_motor_speed_dps(
+            commanded_velocity, config_.joint_velocity_limits_rad_s[index],
+            transmission, index)});
     }
     if (!driver_->enqueue_position_batch(commands)) {
       const auto detail = driver_->last_error();

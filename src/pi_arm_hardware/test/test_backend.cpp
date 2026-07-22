@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <vector>
 
 namespace
@@ -117,6 +118,72 @@ TEST(MockBackend, AppliesManagementToOneMotorOrAll)
   }
   EXPECT_FALSE(
     backend.manage(pi_arm_can::ManagementOperation::MOTOR_OFF, 7).success);
+}
+
+// Documents the one-shot hold contract used by PiArmSystem::read: the first
+// all_fresh sample after activate seeds command from measured state; later
+// cycles leave command to the trajectory controller.
+TEST(MockBackend, FreshFeedbackExposesMeasuredStateForHold)
+{
+  pi_arm_hardware::MockBackend backend(make_config());
+  backend.configure();
+  backend.activate();
+  pi_arm_hardware::HardwareSample sample;
+  for (int index = 0; index < 3; ++index) {
+    ASSERT_TRUE(backend.read(sample));
+  }
+  ASSERT_TRUE(
+    backend.manage(pi_arm_can::ManagementOperation::MOTOR_RUN, 0).success);
+
+  const std::vector<double> positions{0.11, -0.22, 0.33, -0.44, 0.55, -0.66};
+  const std::vector<double> velocities{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  ASSERT_TRUE(backend.write(positions, velocities));
+  ASSERT_TRUE(backend.read(sample));
+  for (const bool fresh : sample.fresh) {
+    EXPECT_TRUE(fresh);
+  }
+  EXPECT_EQ(sample.positions_rad, positions);
+}
+
+TEST(MotorSpeed, NearZeroFallsBackToJointLimit)
+{
+  const pi_arm_can::Transmission transmission({1, 1U, 36.0, 1, 1.0, false});
+  const double limit = 0.17453292519943295;
+  const double expected =
+    std::abs(transmission.joint_velocity_to_motor(limit * (180.0 / 3.14159265358979323846)));
+  const double dps = pi_arm_hardware::resolve_motor_speed_dps(1e-8, limit, transmission, 0);
+  EXPECT_NEAR(dps, expected, 1e-9);
+  EXPECT_GE(dps, pi_arm_hardware::kMinMotorSpeedDps);
+}
+
+TEST(MotorSpeed, TinyNonZeroClampedToProtocolMinimum)
+{
+  // Above the near-zero threshold, but converts to << 1 dps after gearing.
+  const pi_arm_can::Transmission transmission({1, 1U, 36.0, 1, 1.0, false});
+  const double dps =
+    pi_arm_hardware::resolve_motor_speed_dps(1e-5, 0.17453292519943295, transmission, 0);
+  EXPECT_DOUBLE_EQ(dps, pi_arm_hardware::kMinMotorSpeedDps);
+}
+
+TEST(MotorSpeed, CapsAtProtocolMaximum)
+{
+  const pi_arm_can::Transmission transmission({1, 1U, 36.0, 1, 1.0, false});
+  const double dps =
+    pi_arm_hardware::resolve_motor_speed_dps(100.0, 100.0, transmission, 0);
+  EXPECT_DOUBLE_EQ(dps, pi_arm_hardware::kMaxMotorSpeedDps);
+}
+
+TEST(MotorSpeed, NominalSpeedUnchanged)
+{
+  const pi_arm_can::Transmission transmission({1, 1U, 36.0, 1, 1.0, false});
+  const double joint_speed = 0.17453292519943295;
+  const double expected = std::abs(
+    transmission.joint_velocity_to_motor(joint_speed * (180.0 / 3.14159265358979323846)));
+  const double dps =
+    pi_arm_hardware::resolve_motor_speed_dps(joint_speed, joint_speed, transmission, 0);
+  EXPECT_NEAR(dps, expected, 1e-9);
+  EXPECT_GT(dps, pi_arm_hardware::kMinMotorSpeedDps);
+  EXPECT_LT(dps, pi_arm_hardware::kMaxMotorSpeedDps);
 }
 
 }  // namespace

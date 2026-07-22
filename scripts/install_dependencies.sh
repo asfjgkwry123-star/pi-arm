@@ -21,7 +21,10 @@ sudo apt-get install -y \
   ros-jazzy-rviz2 \
   ros-jazzy-xacro
 
+set +u
 source /opt/ros/jazzy/setup.bash
+set -u
+
 if [[ ! -e /etc/ros/rosdep/sources.list.d/20-default.list ]]; then
   sudo rosdep init
 fi

@@ -13,6 +13,23 @@
 namespace pi_arm_hardware
 {
 
+// Joint-space speeds below this are treated as "hold" and fall back to the
+// URDF joint velocity limit (same semantics as an exact 0.0 command). Kept well
+// above machine epsilon so JTC closed-loop noise does not skip the fallback.
+constexpr double kMinCommandedJointSpeedRadS = 1e-6;
+// POSITION_CONTROL_2 protocol: max motor speed must round into [1, 65535] dps.
+constexpr double kMinMotorSpeedDps = 1.0;
+constexpr double kMaxMotorSpeedDps = 65535.0;
+
+// Maps a commanded joint velocity to a protocol-legal motor max-speed (dps).
+// Near-zero joint speeds fall back to joint_velocity_limit_rad_s; results are
+// clamped to [kMinMotorSpeedDps, kMaxMotorSpeedDps]. Exposed for unit tests.
+double resolve_motor_speed_dps(
+  double commanded_joint_velocity_rad_s,
+  double joint_velocity_limit_rad_s,
+  const pi_arm_can::Transmission & transmission,
+  std::size_t joint_index);
+
 struct BackendConfig
 {
   std::string can_interface{"can0"};
@@ -95,6 +112,9 @@ private:
   BackendConfig config_;
   pi_arm_can::TransmissionRegistry transmissions_;
   std::unique_ptr<pi_arm_can::CanDriver> driver_;
+  // Last valid joint angles; used when a poll lacks angle_valid so we never
+  // invent 0.0 as measured feedback for write/hold paths.
+  std::vector<double> last_positions_rad_;
 };
 
 class MockBackend final : public Backend

@@ -63,6 +63,9 @@ private:
   HardwareSample latest_sample_;
   std::mutex sample_mutex_;
   std::atomic_bool hardware_active_{false};
+  // One-shot hold: after activate, copy state→command once when feedback is
+  // first all_fresh. Controllers then own command; do not re-hold every cycle.
+  bool command_hold_synced_{false};
 
   double state_publish_rate_hz_{10.0};
   std::string node_name_{"pi_arm_hardware_services"};

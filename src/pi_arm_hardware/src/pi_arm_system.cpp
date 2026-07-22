@@ -429,7 +429,10 @@ hardware_interface::CallbackReturn PiArmSystem::on_activate(const rclcpp_lifecyc
 {
   try {
     backend_->activate();
-    command_positions_ = state_positions_;
+    // Do not trust state_positions_ here: the control loop has not read yet, so
+    // values are still the init zeros. One-shot hold happens on first all_fresh
+    // read (see read()).
+    command_hold_synced_ = false;
     command_velocities_ = backend_config_.joint_velocity_limits_rad_s;
     {
       std::lock_guard<std::mutex> sample_lock(sample_mutex_);
@@ -447,6 +450,7 @@ hardware_interface::CallbackReturn PiArmSystem::on_deactivate(const rclcpp_lifec
 {
   backend_->deactivate();
   hardware_active_.store(false);
+  command_hold_synced_ = false;
   {
     std::lock_guard<std::mutex> sample_lock(sample_mutex_);
     // Control loop stops updating samples; clear stale motion so manager does
@@ -474,6 +478,20 @@ hardware_interface::return_type PiArmSystem::read(
   }
   state_positions_ = sample.positions_rad;
   state_velocities_ = sample.velocities_rad_s;
+  // One-shot hold (ros2_control convention): seed command from measured state
+  // once when feedback first becomes all_fresh after activate. Do NOT re-hold
+  // every cycle — during trajectories command belongs to the controller (JTC).
+  if (!command_hold_synced_) {
+    const bool all_fresh =
+      !sample.fresh.empty() && sample.fresh.size() == joint_names_.size() &&
+      std::all_of(sample.fresh.begin(), sample.fresh.end(), [](const bool value) {
+        return value;
+      });
+    if (all_fresh) {
+      command_positions_ = state_positions_;
+      command_hold_synced_ = true;
+    }
+  }
   {
     std::lock_guard<std::mutex> sample_lock(sample_mutex_);
     latest_sample_ = std::move(sample);
