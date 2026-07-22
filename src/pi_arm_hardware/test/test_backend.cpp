@@ -29,16 +29,70 @@ TEST(MockBackend, FollowsPositionAndVelocityCommands)
   pi_arm_hardware::MockBackend backend(make_config());
   backend.configure();
   backend.activate();
+  pi_arm_hardware::HardwareSample sample;
+  for (int index = 0; index < 3; ++index) {
+    ASSERT_TRUE(backend.read(sample));
+  }
+  ASSERT_TRUE(
+    backend.manage(pi_arm_can::ManagementOperation::MOTOR_RUN, 0).success);
   const std::vector<double> positions{0.1, 0.2, 0.3, 0.4, 0.5, 0.6};
   const std::vector<double> velocities{0.0, -0.02, 0.03, 0.0, 0.05, 0.06};
   ASSERT_TRUE(backend.write(positions, velocities));
 
-  pi_arm_hardware::HardwareSample sample;
   ASSERT_TRUE(backend.read(sample));
   EXPECT_EQ(sample.positions_rad, positions);
   EXPECT_EQ(sample.velocities_rad_s, velocities);
   EXPECT_FALSE(sample.in_motion[0]);
   EXPECT_TRUE(sample.in_motion[1]);
+}
+
+TEST(MockBackend, ClampsVelocityAboveLimit)
+{
+  pi_arm_hardware::MockBackend backend(make_config());
+  backend.configure();
+  backend.activate();
+  pi_arm_hardware::HardwareSample sample;
+  for (int index = 0; index < 3; ++index) {
+    ASSERT_TRUE(backend.read(sample));
+  }
+  ASSERT_TRUE(
+    backend.manage(pi_arm_can::ManagementOperation::MOTOR_RUN, 0).success);
+  const std::vector<double> positions{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  const std::vector<double> velocities{0.2, 0.0, 0.0, 0.0, 0.0, 0.0};
+  ASSERT_TRUE(backend.write(positions, velocities));
+
+  ASSERT_TRUE(backend.read(sample));
+  EXPECT_NEAR(sample.velocities_rad_s[0], 0.17453292519943295, 1e-9);
+  EXPECT_TRUE(sample.in_motion[0]);
+}
+
+TEST(MockBackend, DeactivateClearsMotionAndDisconnects)
+{
+  pi_arm_hardware::MockBackend backend(make_config());
+  backend.configure();
+  backend.activate();
+  pi_arm_hardware::HardwareSample sample;
+  for (int index = 0; index < 3; ++index) {
+    ASSERT_TRUE(backend.read(sample));
+  }
+  ASSERT_TRUE(
+    backend.manage(pi_arm_can::ManagementOperation::MOTOR_RUN, 0).success);
+  const std::vector<double> positions{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  const std::vector<double> velocities{0.05, 0.05, 0.05, 0.05, 0.05, 0.05};
+  ASSERT_TRUE(backend.write(positions, velocities));
+
+  backend.deactivate();
+  ASSERT_TRUE(backend.read(sample));
+  EXPECT_FALSE(sample.connected);
+  for (const double velocity : sample.velocities_rad_s) {
+    EXPECT_DOUBLE_EQ(velocity, 0.0);
+  }
+  for (const bool moving : sample.in_motion) {
+    EXPECT_FALSE(moving);
+  }
+  for (const bool fresh : sample.fresh) {
+    EXPECT_FALSE(fresh);
+  }
 }
 
 TEST(MockBackend, AppliesManagementToOneMotorOrAll)

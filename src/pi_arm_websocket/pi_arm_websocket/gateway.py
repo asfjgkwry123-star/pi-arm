@@ -11,7 +11,7 @@ import rclpy
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import PoseStamped
 from pi_arm_interfaces.action import DirectMove, MoveJ, MoveJs, MoveL
-from pi_arm_interfaces.msg import RobotState
+from pi_arm_interfaces.msg import RobotState, TaskState
 from pi_arm_interfaces.srv import ManageMotor, StopMotion
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -126,12 +126,20 @@ class RosBridge(Node):
         if state is None:
             self.get_logger().warning(f"action {action_name} 拒绝: 状态尚未就绪")
             raise ProtocolError(CODE_STATE_UNAVAILABLE, "机械臂状态尚未就绪")
-        if state.state == RobotState.RUNNING:
+        # Busy only while a task is actually running. Do not treat residual
+        # robot_state=RUNNING (e.g. still_frames mask after FAILED) as busy.
+        if state.task.status == TaskState.RUNNING:
             self.get_logger().warning(
                 f"action {action_name} 拒绝: 忙 (task={state.task.command}/{state.task.task_id})"
             )
             raise ProtocolError(CODE_MOTION_BUSY, "已有运动任务正在运行")
-        if state.state != RobotState.READY:
+        effective_state = state.state
+        if (
+            effective_state == RobotState.RUNNING
+            and state.task.status != TaskState.RUNNING
+        ):
+            effective_state = RobotState.READY
+        if effective_state != RobotState.READY:
             self.get_logger().warning(
                 f"action {action_name} 拒绝: 状态={state.state_name}"
             )

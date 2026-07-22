@@ -431,6 +431,11 @@ hardware_interface::CallbackReturn PiArmSystem::on_activate(const rclcpp_lifecyc
     backend_->activate();
     command_positions_ = state_positions_;
     command_velocities_ = backend_config_.joint_velocity_limits_rad_s;
+    {
+      std::lock_guard<std::mutex> sample_lock(sample_mutex_);
+      latest_sample_.connected = true;
+    }
+    hardware_active_.store(true);
     return hardware_interface::CallbackReturn::SUCCESS;
   } catch (const std::exception & error) {
     RCLCPP_ERROR(rclcpp::get_logger("PiArmSystem"), "Activation failed: %s", error.what());
@@ -441,6 +446,18 @@ hardware_interface::CallbackReturn PiArmSystem::on_activate(const rclcpp_lifecyc
 hardware_interface::CallbackReturn PiArmSystem::on_deactivate(const rclcpp_lifecycle::State &)
 {
   backend_->deactivate();
+  hardware_active_.store(false);
+  {
+    std::lock_guard<std::mutex> sample_lock(sample_mutex_);
+    // Control loop stops updating samples; clear stale motion so manager does
+    // not keep seeing RUNNING from frozen in_motion flags.
+    std::fill(
+      latest_sample_.velocities_rad_s.begin(), latest_sample_.velocities_rad_s.end(), 0.0);
+    std::fill(latest_sample_.in_motion.begin(), latest_sample_.in_motion.end(), false);
+    std::fill(latest_sample_.fresh.begin(), latest_sample_.fresh.end(), false);
+    latest_sample_.connected = false;
+  }
+  std::fill(state_velocities_.begin(), state_velocities_.end(), 0.0);
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -548,6 +565,13 @@ void PiArmSystem::publish_hardware_state()
   {
     std::lock_guard<std::mutex> lock(sample_mutex_);
     sample = latest_sample_;
+  }
+  if (!hardware_active_.load()) {
+    // Belt-and-suspenders: never advertise frozen motion while inactive.
+    std::fill(sample.velocities_rad_s.begin(), sample.velocities_rad_s.end(), 0.0);
+    std::fill(sample.in_motion.begin(), sample.in_motion.end(), false);
+    std::fill(sample.fresh.begin(), sample.fresh.end(), false);
+    sample.connected = false;
   }
   pi_arm_interfaces::msg::HardwareState message;
   fill_hardware_state_message(

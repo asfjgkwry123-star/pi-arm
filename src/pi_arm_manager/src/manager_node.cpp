@@ -64,7 +64,9 @@ constexpr const char * kPilzLinPlanner = "LIN";
 
 double clamp_scaling(double value)
 {
-  return std::clamp(value, 0.001, 1.0);
+  // Leave headroom under URDF limits so TOTP/JTC interpolation does not
+  // command velocities that barely exceed max_velocity.
+  return std::clamp(value, 0.001, 0.95);
 }
 
 void validate_timed_trajectory(const trajectory_msgs::msg::JointTrajectory & trajectory)
@@ -390,7 +392,12 @@ private:
       hardware.connected = false;
     }
     const auto state = aggregate_state(hardware, task_);
-    if (state == pi_arm_interfaces::msg::RobotState::READY && still_frames_.load() < 3) {
+    // Only hold RUNNING for settling while a motion claim is active. After
+    // FAILED/CANCELED/SUCCEEDED the claim is released; still_frames must not
+    // fake RUNNING or subsequent goals are blocked as "busy".
+    if (state == pi_arm_interfaces::msg::RobotState::READY &&
+      task_claimed_.load() && still_frames_.load() < 3)
+    {
       return pi_arm_interfaces::msg::RobotState::RUNNING;
     }
     return state;
@@ -413,7 +420,7 @@ private:
     }
     message.state = aggregate_state(state_input, message.task);
     if (message.state == pi_arm_interfaces::msg::RobotState::READY &&
-      still_frames_.load() < 3)
+      task_claimed_.load() && still_frames_.load() < 3)
     {
       message.state = pi_arm_interfaces::msg::RobotState::RUNNING;
     }

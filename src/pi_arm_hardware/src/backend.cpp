@@ -2,9 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <exception>
 #include <limits>
 #include <utility>
+
+#include "rclcpp/clock.hpp"
+#include "rclcpp/logging.hpp"
 
 namespace pi_arm_hardware
 {
@@ -12,6 +16,51 @@ namespace
 {
 
 constexpr double kDegreesPerRadian = 57.2957795130823208768;
+constexpr int64_t kWriteRejectLogPeriodMs = 1000;
+
+rclcpp::Logger backend_logger()
+{
+  return rclcpp::get_logger("PiArmBackend");
+}
+
+rclcpp::Clock & steady_clock()
+{
+  static rclcpp::Clock clock(RCL_STEADY_TIME);
+  return clock;
+}
+
+template<typename ... Args>
+void log_write_reject(const char * format, Args && ... args) noexcept
+{
+  try {
+    RCLCPP_ERROR_THROTTLE(
+      backend_logger(), steady_clock(), kWriteRejectLogPeriodMs,
+      format, std::forward<Args>(args)...);
+  } catch (...) {
+  }
+}
+
+template<typename ... Args>
+void log_write_warn(const char * format, Args && ... args) noexcept
+{
+  try {
+    RCLCPP_WARN_THROTTLE(
+      backend_logger(), steady_clock(), kWriteRejectLogPeriodMs,
+      format, std::forward<Args>(args)...);
+  } catch (...) {
+  }
+}
+
+double clamp_joint_velocity(double velocity, double velocity_limit, std::size_t index) noexcept
+{
+  if (!(std::abs(velocity) > velocity_limit + 1e-6)) {
+    return velocity;
+  }
+  log_write_warn(
+    "write velocity clamped at joint[%zu]: vel=%.6g -> lim=%.6g",
+    index, velocity, velocity_limit);
+  return std::copysign(velocity_limit, velocity);
+}
 
 double age_seconds(
   const std::chrono::steady_clock::time_point timestamp,
@@ -158,6 +207,10 @@ bool RealBackend::write(
     config_.joint_upper_limits_rad.size() != positions_rad.size() ||
     config_.joint_velocity_limits_rad_s.size() != positions_rad.size())
   {
+    log_write_reject(
+      "write rejected: size/config mismatch (driver=%d pos=%zu vel=%zu joints=%zu)",
+      driver_ ? 1 : 0, positions_rad.size(), velocities_rad_s.size(),
+      config_.transmissions.size());
     return false;
   }
   if (driver_->mode() == pi_arm_can::DriverMode::MONITORING ||
@@ -166,6 +219,9 @@ bool RealBackend::write(
     return true;
   }
   if (driver_->mode() != pi_arm_can::DriverMode::CONTROL) {
+    log_write_reject(
+      "write rejected: driver mode is not CONTROL (mode=%d)",
+      static_cast<int>(driver_->mode()));
     return false;
   }
   try {
@@ -173,17 +229,25 @@ bool RealBackend::write(
     commands.reserve(positions_rad.size());
     for (std::size_t index = 0; index < positions_rad.size(); ++index) {
       if (!std::isfinite(positions_rad[index]) || !std::isfinite(velocities_rad_s[index])) {
+        log_write_reject(
+          "write rejected: non-finite command at joint[%zu] pos=%.6g vel=%.6g",
+          index, positions_rad[index], velocities_rad_s[index]);
         return false;
       }
       if (positions_rad[index] < config_.joint_lower_limits_rad[index] ||
-        positions_rad[index] > config_.joint_upper_limits_rad[index] ||
-        std::abs(velocities_rad_s[index]) > config_.joint_velocity_limits_rad_s[index] + 1e-6)
+        positions_rad[index] > config_.joint_upper_limits_rad[index])
       {
+        log_write_reject(
+          "write rejected: position limit exceeded at joint[%zu] pos=%.6g lim=[%.6g,%.6g]",
+          index, positions_rad[index],
+          config_.joint_lower_limits_rad[index], config_.joint_upper_limits_rad[index]);
         return false;
       }
+      const double commanded_velocity = clamp_joint_velocity(
+        velocities_rad_s[index], config_.joint_velocity_limits_rad_s[index], index);
       const auto & transmission = transmissions_.by_joint_id(
         config_.transmissions[index].joint_id);
-      double requested_speed = std::abs(velocities_rad_s[index]);
+      double requested_speed = std::abs(commanded_velocity);
       if (requested_speed < std::numeric_limits<double>::epsilon()) {
         requested_speed = config_.joint_velocity_limits_rad_s[index];
       }
@@ -193,8 +257,16 @@ bool RealBackend::write(
           transmission.joint_position_to_motor(positions_rad[index] * kDegreesPerRadian),
           std::abs(transmission.joint_velocity_to_motor(requested_speed * kDegreesPerRadian))});
     }
-    return driver_->enqueue_position_batch(commands);
+    if (!driver_->enqueue_position_batch(commands)) {
+      const auto detail = driver_->last_error();
+      log_write_reject(
+        "write rejected: enqueue_position_batch failed (%s)",
+        detail.empty() ? "no detail" : detail.c_str());
+      return false;
+    }
+    return true;
   } catch (...) {
+    log_write_reject("write rejected: unexpected exception");
     return false;
   }
 }
@@ -266,6 +338,7 @@ void MockBackend::activate()
     throw std::runtime_error("mock backend is not configured");
   }
   active_ = true;
+  sample_.connected = true;
   sample_.driver_mode = "CONTROL";
 }
 
@@ -273,7 +346,11 @@ void MockBackend::deactivate() noexcept
 {
   std::lock_guard<std::mutex> lock(mutex_);
   active_ = false;
+  sample_.connected = false;
   sample_.driver_mode = configured_ ? "MONITORING" : "OFFLINE";
+  std::fill(sample_.velocities_rad_s.begin(), sample_.velocities_rad_s.end(), 0.0);
+  std::fill(sample_.in_motion.begin(), sample_.in_motion.end(), false);
+  std::fill(sample_.fresh.begin(), sample_.fresh.end(), false);
 }
 
 void MockBackend::cleanup() noexcept
@@ -309,18 +386,32 @@ bool MockBackend::write(
     config_.joint_upper_limits_rad.size() != positions_rad.size() ||
     config_.joint_velocity_limits_rad_s.size() != positions_rad.size())
   {
+    log_write_reject(
+      "mock write rejected: inactive or size/config mismatch (active=%d pos=%zu expected=%zu)",
+      active_ ? 1 : 0, positions_rad.size(), sample_.positions_rad.size());
     return false;
   }
   for (std::size_t index = 0; index < positions_rad.size(); ++index) {
     if (!std::isfinite(positions_rad[index]) || !std::isfinite(velocities_rad_s[index])) {
+      log_write_reject(
+        "mock write rejected: non-finite command at joint[%zu] pos=%.6g vel=%.6g",
+        index, positions_rad[index], velocities_rad_s[index]);
       return false;
     }
     if (positions_rad[index] < config_.joint_lower_limits_rad[index] ||
-      positions_rad[index] > config_.joint_upper_limits_rad[index] ||
-      std::abs(velocities_rad_s[index]) > config_.joint_velocity_limits_rad_s[index] + 1e-6)
+      positions_rad[index] > config_.joint_upper_limits_rad[index])
     {
+      log_write_reject(
+        "mock write rejected: position limit exceeded at joint[%zu] pos=%.6g lim=[%.6g,%.6g]",
+        index, positions_rad[index],
+        config_.joint_lower_limits_rad[index], config_.joint_upper_limits_rad[index]);
       return false;
     }
+  }
+  std::vector<double> clamped_velocities = velocities_rad_s;
+  for (std::size_t index = 0; index < clamped_velocities.size(); ++index) {
+    clamped_velocities[index] = clamp_joint_velocity(
+      clamped_velocities[index], config_.joint_velocity_limits_rad_s[index], index);
   }
   const bool all_enabled =
     !sample_.enabled.empty() &&
@@ -333,10 +424,10 @@ bool MockBackend::write(
     return true;
   }
   sample_.positions_rad = positions_rad;
-  sample_.velocities_rad_s = velocities_rad_s;
-  for (std::size_t index = 0; index < velocities_rad_s.size(); ++index) {
+  sample_.velocities_rad_s = clamped_velocities;
+  for (std::size_t index = 0; index < clamped_velocities.size(); ++index) {
     sample_.in_motion[index] =
-      std::abs(velocities_rad_s[index]) > config_.moving_speed_threshold_rad_s;
+      std::abs(clamped_velocities[index]) > config_.moving_speed_threshold_rad_s;
     sample_.ages_sec[index] = 0.0;
   }
   return true;

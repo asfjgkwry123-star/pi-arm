@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <atomic>
 
 namespace pi_arm_hardware
 {
@@ -61,6 +62,7 @@ private:
   std::vector<double> command_velocities_;
   HardwareSample latest_sample_;
   std::mutex sample_mutex_;
+  std::atomic_bool hardware_active_{false};
 
   double state_publish_rate_hz_{10.0};
   std::string node_name_{"pi_arm_hardware_services"};
